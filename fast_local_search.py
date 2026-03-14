@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-fast_local_search.py  —  C-worker-backed local parallel search
+fast_local_search.py  --  C-worker-backed local parallel search (v2: Pollard-rho)
 
-Uses the compiled worker_s3ceq binary (100-1000x faster than pure Python)
+Uses the compiled worker_s3ceq binary (v2: Pollard-rho factorisation;
+~1000x faster than pure Python, ~26000 n/s at n~50000)
 to search all integers n for solutions to:
 
-    Y^2 = (m + 6n)^2 + (36n^3 - 19) / m     (m ≠ 0, m | 36n^3-19)
+    Y^2 = (m + 6n)^2 + (36n^3 - 19) / m     (m != 0, m | 36n^3-19)
 
 Runs indefinitely, expanding outward from n=0 in both directions.
 Uses multiprocessing to run multiple C workers in parallel.
@@ -13,7 +14,7 @@ All results are deduplicated and appended to solutions_master.txt.
 
 Usage:
     python fast_local_search.py [--workers N] [--band B]
-    python fast_local_search.py --workers 4 --band 10000
+    python fast_local_search.py --workers 4 --band 100000
 """
 
 import sys
@@ -42,18 +43,21 @@ def adaptive_band(n_abs: int, target_ops: float = 4e9) -> int:
     """
     Return band size so each task takes ~constant computational work.
 
-    Work per n at |n|=N:  O(sqrt(|36n^3 - 19|)) ≈ 6 * N^(3/2)
-    Total for a band of B values starting at N:  ≈ B * 6 * N^(3/2)
-    Set equal to target_ops and solve for B.
+    v2 worker uses Pollard-rho factorisation, so cost per n is
+    O(val^(1/4)) ~ O(n^(3/4)) instead of O(sqrt(val)) ~ O(n^(3/2)).
+    Empirical: v2 does n=[0,100000] in ~3.8s → ~26,000 n/s at n~50000.
 
-    target_ops = 4e9 → ~4 seconds on a 1 GHz C worker per task (good for CE).
-    Clamp to [1, 200_000].
+    Model cost-per-n ≈ C * n^0.75; solve B * C * N^0.75 = target_ops.
+    Calibrated so n=50000 → ~50000 band (≈2s per task).
+
+    Clamp to [1, 500_000].
     """
-    if n_abs < 10:
-        return 200_000   # tiny n: trivially fast, use huge bands
-    work_per_n = 6.0 * (float(n_abs) ** 1.5)
-    band = int(target_ops / work_per_n)
-    return max(1, min(band, 200_000))
+    if n_abs < 2:
+        return 100_000
+    # Pollard-rho: cost ~ n^(3/4) per value; calibrate with C=0.005
+    cost_per_n = max(1.0, 0.005 * (float(n_abs) ** 0.75))
+    band = int(target_ops / cost_per_n)
+    return max(1, min(band, 500_000))
 
 # ── logging ───────────────────────────────────────────────────────────────────
 def log(msg: str):
@@ -145,8 +149,8 @@ def main():
                         default=max(1, mp.cpu_count() - 1))
     parser.add_argument("--band", type=int, default=None,
                         help="Fixed band size (overrides adaptive sizing)")
-    parser.add_argument("--target_ops", type=float, default=4e9,
-                        help="Target ops per task for adaptive band (default 4e9 ≈ 4s)")
+    parser.add_argument("--target_ops", type=float, default=5e8,
+                        help="Target ops per task for adaptive band (default 5e8 ≈ 1-5s)")
     parser.add_argument("--start_n", type=int, default=None)
     args = parser.parse_args()
 
