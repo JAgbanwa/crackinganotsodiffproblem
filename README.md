@@ -4,6 +4,12 @@ Search for all integer solutions to Equation 7.10 from
 [this Figshare preprint](https://figshare.com/articles/preprint/Closed_form_formulas_on_the_sums_of_three_cubes_for_k_114_192_/30509981),
 run on [Charity Engine](https://www.charityengine.com/) (BOINC distributed computing).
 
+**Ultimate goal:** Crack the open problem $x^3 + y^3 + z^3 = 114$.  
+Every integer solution to the equation below directly yields such a triple.  
+114 is the smallest number not yet known to be representable as a sum of three cubes.
+
+---
+
 ## The Equation
 
 $$Y^2 = (m + 6n)^2 + \frac{36n^3 - 19}{m}, \quad m \neq 0, \; m \mid 36n^3-19$$
@@ -12,16 +18,29 @@ For each integer $n$, let $\text{val} = 36n^3 - 19$.
 We enumerate all integer divisors $m$ of $\text{val}$ and check whether
 $(m+6n)^2 + \text{val}/m$ is a perfect square.
 
-## Algorithm (v2 — Pollard-rho)
+---
+
+## Algorithm (v3 — 128-bit Pollard-rho)
 
 | Step | Method | Cost |
 |------|--------|------|
-| Factorise \|val\| | Pollard-rho + Miller-Rabin | $O(\text{val}^{1/4})$ |
+| Factorise \|val\| ≤ 2⁶⁴ | 64-bit Pollard-rho + Miller-Rabin | $O(\text{val}^{1/4})$ |
+| Factorise \|val\| > 2⁶⁴ | **128-bit** Pollard-rho + Miller-Rabin | $O(\text{val}^{1/4})$ |
 | Enumerate divisors | from prime factorisation | $O(d(\text{val}))$ |
-| Check perfect square | Newton isqrt on \_\_int128 | $O(\log \text{val})$ |
+| Check perfect square | Newton isqrt on `__int128` | $O(\log \text{val})$ |
 
-**Benchmark:** ~26,000 $n$/second per CPU core on a 2.5 GHz machine  
-(vs ~26 $n$/sec with naive $O(\sqrt{\text{val}})$ trial division on the same core — **1000× speedup**).
+**v3 vs v2:**  
+- v2 had a hard 64-bit ceiling: fast factorisation only up to $|n| \leq 787{,}000$  
+- v3 uses full 128-bit Pollard-rho, extending the fast path to $|n| \leq 2.1 \times 10^{12}$  
+- For $|n|$ up to 787k: **~26,000 n/sec** per core (same as v2 — 64-bit path preserved)  
+- For $|n|$ = 800k–2.1T: **~830 n/sec** per core (128-bit mulmod via binary method)
+
+**Search ceiling with CE (500k cores):**
+
+| Range | Time at 500k cores |
+|-------|--------------------|
+| $\|n\| \leq 787{,}000$ (v2 ceiling) | < 1 second |
+| $\|n\| \leq 2.1 \times 10^{12}$ (v3 ceiling) | ~2.5 hours |
 
 ---
 
@@ -31,8 +50,11 @@ $(m+6n)^2 + \text{val}/m$ is a perfect square.
 # Build the native binary
 make all
 
-# Search n = [0, 1,000,000] (~38 seconds on a single core)
+# Search n = [0, 1,000,000] (~38 seconds on a single core, v3 fast path)
 echo "0 1000000" > wu.txt && time ./worker_s3ceq wu.txt out.txt
+
+# Search beyond the old 64-bit ceiling (n = 800k–810k) — uses 128-bit Pollard-rho
+echo "800000 810000" > wu.txt && time ./worker_s3ceq wu.txt out.txt
 
 # Parallel search (forever, 4 workers, auto-resumable)
 python3 fast_local_search.py --workers 4
@@ -149,7 +171,7 @@ bash setup_boinc_project.sh
 
 | File | Purpose |
 |------|---------|
-| `worker.c` | C worker (v2: Pollard-rho) — runs on volunteer machines |
+| `worker.c` | C worker (v3: 128-bit Pollard-rho) — runs on volunteer machines |
 | `fast_local_search.py` | Local parallel search using C worker |
 | `work_generator.py` | BOINC work unit generator (runs on server) |
 | `validator.py` | Algebraic result verifier (runs on server) |
@@ -164,10 +186,29 @@ bash setup_boinc_project.sh
 
 ---
 
-## Known Results
+## Search Progress
 
-No solutions found in $n \in [-100000, 100000]$ as of the latest search run.
-The search is ongoing.
+| Date | Range searched | Solutions | Worker version |
+|------|---------------|-----------|----------------|
+| 2026-03-14 | $n \in [-100{,}000,\, 100{,}000]$ | 0 | v2 (Pollard-rho, 64-bit) |
+| 2026-03-14 | v3 deployed — ceiling extended to $\|n\| \leq 2.1 \times 10^{12}$ | — | v3 (128-bit Pollard-rho) |
+
+The search is **ongoing** and expands continuously outward from $n = 0$.
+
+### Version History
+
+| Version | Key change | Speed |
+|---------|-----------|-------|
+| v1 | Trial division $O(\sqrt{\text{val}})$ | ~26 n/s/core |
+| v2 | 64-bit Pollard-rho; ceiling $\|n\| \leq 787k$ | ~26,000 n/s/core |
+| **v3** | **128-bit Pollard-rho; ceiling $\|n\| \leq 2.1 \times 10^{12}$** | **~26,000 n/s/core** (≤787k), **~830 n/s/core** (>787k) |
+
+### Why 114?
+
+$114 \equiv 6 \pmod{9}$ — not ruled out by the standard modular obstruction.  
+It is the smallest positive integer whose status as a sum of three cubes remains unknown (as of 2026).  
+The analogous problems for 33, 42, and 3 were all eventually solved — 33 and 42 in 2019 by Booker & Sutherland with solutions reaching $10^{15}$.  
+Our parametric Equation 7.10 provides a targeted algebraic path specifically to 114.
 
 ---
 
