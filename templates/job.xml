@@ -1,3 +1,8 @@
+<!-- job.xml  --  work-unit template for s3ceq_worker
+     v2 worker (Pollard-rho): ~26000 n/s on a 2.5 GHz core.
+     50000-n WU => ~2s on a modern PC.
+     fpops_est calibrated: 50000 n * 5e6 ops/n = 2.5e11 flops.
+-->
 <workunit>
   <file_info>
     <number>0</number>
@@ -8,15 +13,19 @@
       <file_number>0</file_number>
       <open_name>wu_input.txt</open_name>
     </file_ref>
+    <!-- Quorum: 2 matching results before accepting -->
     <min_quorum>2</min_quorum>
     <target_nresults>3</target_nresults>
     <max_error_results>5</max_error_results>
     <max_total_results>8</max_total_results>
     <max_success_results>4</max_success_results>
+    <!-- 24-hour deadline per WU (generous for slow volunteer machines) -->
     <delay_bound>86400</delay_bound>
-    <rsc_fpops_est>1e12</rsc_fpops_est>
-    <rsc_fpops_bound>1e14</rsc_fpops_bound>
-    <rsc_memory_bound>2e8</rsc_memory_bound>
-    <rsc_disk_bound>1e8</rsc_disk_bound>
+    <!-- v2 Pollard-rho: 50k n * ~5M ops/n = 2.5e11 fpops -->
+    <rsc_fpops_est>2.5e11</rsc_fpops_est>
+    <rsc_fpops_bound>2.5e13</rsc_fpops_bound>
+    <!-- 64MB RAM, 10MB disk -->
+    <rsc_memory_bound>6.4e7</rsc_memory_bound>
+    <rsc_disk_bound>1e7</rsc_disk_bound>
   </workunit>
 </workunit>

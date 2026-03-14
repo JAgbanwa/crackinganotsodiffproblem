@@ -1,0 +1,81 @@
+version: '3.8'
+
+# docker-compose.yml  —  Charity Engine / BOINC server for S3CEQ project
+#
+# Usage:
+#   cp .env.example .env          # edit URL_BASE, passwords
+#   docker compose up -d          # start everything
+#   docker compose logs -f boinc  # follow logs
+#
+# Point your domain's A record at the VPS IP, then set URL_BASE=http://yourdomain.com
+
+services:
+
+  # ── MySQL 8 database ──────────────────────────────────────────────────────
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-root_changeme}"
+      MYSQL_USER:          "${DB_USER:-boincadm}"
+      MYSQL_PASSWORD:      "${DB_PASS:-boinc_changeme}"
+      MYSQL_DATABASE:      "${DB_NAME:-s3ceq}"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost",
+             "-u", "${DB_USER:-boincadm}", "-p${DB_PASS:-boinc_changeme}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks:
+      - boinc_net
+
+  # ── BOINC server ──────────────────────────────────────────────────────────
+  boinc:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    environment:
+      URL_BASE:     "${URL_BASE:-http://localhost}"
+      DB_HOST:      mysql
+      DB_NAME:      "${DB_NAME:-s3ceq}"
+      DB_USER:      "${DB_USER:-boincadm}"
+      DB_PASS:      "${DB_PASS:-boinc_changeme}"
+      PROJECT_NAME: s3ceq
+    volumes:
+      - boinc_projects:/home/boincadm/projects
+      - ./solutions_master.txt:/srv/s3ceq/solutions_master.txt
+    depends_on:
+      mysql:
+        condition: service_healthy
+    networks:
+      - boinc_net
+
+  # ── Optional: phpMyAdmin for database inspection ──────────────────────────
+  phpmyadmin:
+    image: phpmyadmin:latest
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    environment:
+      PMA_HOST: mysql
+      PMA_USER: "${DB_USER:-boincadm}"
+      PMA_PASSWORD: "${DB_PASS:-boinc_changeme}"
+    depends_on:
+      - mysql
+    networks:
+      - boinc_net
+    profiles:
+      - debug   # only starts with: docker compose --profile debug up
+
+volumes:
+  mysql_data:
+  boinc_projects:
+
+networks:
+  boinc_net:
+    driver: bridge

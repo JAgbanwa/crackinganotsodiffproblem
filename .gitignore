@@ -1,4 +1,8 @@
 worker_s3ceq
+worker_s3ceq_linux
+worker_v1_bin
+apps/
+.env
 *.o
 __pycache__/
 *.pyc
