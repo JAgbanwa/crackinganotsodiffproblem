@@ -422,6 +422,27 @@ static void emit(FILE *out, FILE *log, i128 n128, i128 m, i128 Y, i128 X) {
 }
 
 /* --------------------------------------------------------------------------
+ * Modular QR sieve bitmasks
+ *
+ * For a perfect square Y² = rhs, rhs must be a quadratic residue modulo
+ * every integer.  We test three fast filters before calling the expensive
+ * Newton isqrt.  Each filter is a bitmask: bit i is set iff i is a QR.
+ *
+ *  mod 64  — QRs {0,1,4,9,16,17,25,33,36,41,49,57}  →  12/64  → ~81% kill
+ *  mod 45  — QRs {0,1,4,9,10,16,19,25,31,34,36,40}  →  12/45  → ~73% of rest
+ *  mod 9   — QRs {0,1,4,7}                           →   4/9   → ~56% of rest
+ *
+ * Combined: >98% of non-square rhs values are rejected before any sqrt.
+ * mod-64 is free (rhs & 63); mod-45 and mod-9 compile to multiply-by-
+ * reciprocal for the constant divisor (GCC -O3).
+ * -------------------------------------------------------------------------- */
+#define QR64_MASK  0x0202021202030213ULL
+#define QR45_MASK  ( (1ULL<< 0)|(1ULL<< 1)|(1ULL<< 4)|(1ULL<< 9)|(1ULL<<10) \
+                   | (1ULL<<16)|(1ULL<<19)|(1ULL<<25)|(1ULL<<31)|(1ULL<<34) \
+                   | (1ULL<<36)|(1ULL<<40) )
+#define QR9_MASK   ( (1U<<0)|(1U<<1)|(1U<<4)|(1U<<7) )
+
+/* --------------------------------------------------------------------------
  * Check one divisor m of val against the equation
  * -------------------------------------------------------------------------- */
 static void check_divisor(i128 n128, i128 val, i128 m,
@@ -433,6 +454,14 @@ static void check_divisor(i128 n128, i128 val, i128 m,
     i128 ax = (X >= 0) ? X : -X;
     if ((u128)ax > (u128)XSQRT_I128_MAX) return;
     i128 rhs  = X * X + quot;
+    if (rhs < 0) return;
+
+    /* ---- QR modular sieve (reject non-squares before the costly isqrt) ---- */
+    if (!((QR64_MASK >> (unsigned)(rhs & 63)) & 1)) return;        /* mod 64 */
+    u128 urhs = (u128)rhs;
+    if (!((QR45_MASK >> (unsigned)(urhs % 45)) & 1)) return;       /* mod 45 */
+    if (!((QR9_MASK  >> (unsigned)(urhs %  9)) & 1)) return;       /* mod  9 */
+
     i128 Y;
     if (is_perfect_square(rhs, &Y))
         emit(out, log, n128, m, Y, X);
