@@ -1,7 +1,6 @@
-worker_s3ceq
-worker_s3ceq_linux
-worker_v1_bin
-apps/
+# Native build artifacts (not committed)
+/worker_s3ceq
+/worker_v1_bin
 .env
 *.o
 __pycache__/
