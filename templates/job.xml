@@ -1,0 +1,22 @@
+<workunit>
+  <file_info>
+    <number>0</number>
+  </file_info>
+  <workunit>
+    <app_version_min_version>100</app_version_min_version>
+    <file_ref>
+      <file_number>0</file_number>
+      <open_name>wu_input.txt</open_name>
+    </file_ref>
+    <min_quorum>2</min_quorum>
+    <target_nresults>3</target_nresults>
+    <max_error_results>5</max_error_results>
+    <max_total_results>8</max_total_results>
+    <max_success_results>4</max_success_results>
+    <delay_bound>86400</delay_bound>
+    <rsc_fpops_est>1e12</rsc_fpops_est>
+    <rsc_fpops_bound>1e14</rsc_fpops_bound>
+    <rsc_memory_bound>2e8</rsc_memory_bound>
+    <rsc_disk_bound>1e8</rsc_disk_bound>
+  </workunit>
+</workunit>
