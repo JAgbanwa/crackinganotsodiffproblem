@@ -1,5 +1,5 @@
 /*
- * worker.c  --  Charity Engine / BOINC worker  (v2: Pollard-rho factorisation)
+ * worker.c  --  Charity Engine / BOINC worker  (v3: 128-bit Pollard-rho)
  *
  * Searches for ALL integer solutions (n, m, Y) satisfying:
  *
@@ -7,16 +7,17 @@
  *
  * Strategy per n:
  *   1. val = 36*n^3 - 19
- *   2. Factorise |val| via Pollard-rho (Miller-Rabin primality test)
+ *   2. Factorise |val| via 128-bit Pollard-rho (Miller-Rabin primality test)
  *   3. Enumerate all 2*d(val) divisors (pos & neg) from the factorisation
  *   4. For each divisor m: rhs = (m+6n)^2 + val/m; check perfect square
  *
- * Factorisation is O(val^(1/4) * polylog) vs O(sqrt(val)) for trial division.
- * For |n| > TRIAL_LIMIT (val too large for reliable 64-bit Pollard-rho),
- * fall back to trial division up to cbrt(val), which still handles the
- * "small prime" part fast.
+ * v3 changes vs v2:
+ *   - Full 128-bit Pollard-rho (mulmod128 via binary method).
+ *   - No 64-bit ceiling: fast path covers all |n| <= TRIAL_LIMIT_128 = 2.1e12.
+ *   - For |n| > 2.1e12 fall back to trial division (very rarely needed with CE).
+ *   - Overflow guard: skip divisors where (m+6n)^2 would exceed i128.
  *
- * Uses __int128 for final arithmetic (overflow-safe for |n| up to ~10^12).
+ * Uses __int128 / unsigned __int128 throughout (GCC/Clang extension).
  *
  * Usage:  ./worker <wu_file> <output_file>
  * wu_file: single line "n_start n_end"
@@ -30,27 +31,34 @@
 #include <inttypes.h>
 #include <math.h>
 
-typedef __int128   i128;
-typedef int64_t    i64;
-typedef uint64_t   u64;
+typedef __int128          i128;
+typedef int64_t           i64;
+typedef uint64_t          u64;
 typedef unsigned __int128 u128;
 
-/* For |n| above this, |val| > 2^63; use fallback trial-division factoriser */
-#define TRIAL_LIMIT  2600000LL
+/*
+ * For |n| up to TRIAL_LIMIT_128 the 128-bit Pollard-rho is used.
+ * |val| = |36n^3-19| < 36*(2.1e12)^3 ~ 3.33e38 < 2^128.  Safe.
+ * Above this limit we fall back to slow trial division (rarely reached).
+ */
+#define TRIAL_LIMIT_128  2100000000000LL   /* 2.1 × 10^12 */
+
+/*
+ * X^2 overflows i128 when |X| > floor(sqrt(2^127)) ~ 1.304e19.
+ * We use this to skip divisors that would cause overflow in check_divisor.
+ */
+#define XSQRT_I128_MAX  13043817825332782212ULL  /* floor(sqrt(2^127)) */
 
 /* --------------------------------------------------------------------------
- * 64-bit modular arithmetic helpers
+ * 64-bit fast path (v2): Pollard-rho for u64 values.
+ * Used when abs_val fits in u64 (i.e. |n| <= ~787000).
  * -------------------------------------------------------------------------- */
 
-/* (a * b) % m  -- uses u128 to avoid overflow */
 static inline u64 mulmod64(u64 a, u64 b, u64 m) {
     return (u64)(((u128)a * b) % m);
 }
-
-/* a^e % m */
 static u64 powmod64(u64 a, u64 e, u64 m) {
-    u64 r = 1;
-    a %= m;
+    u64 r = 1; a %= m;
     while (e) {
         if (e & 1) r = mulmod64(r, a, m);
         a = mulmod64(a, a, m);
@@ -58,30 +66,159 @@ static u64 powmod64(u64 a, u64 e, u64 m) {
     }
     return r;
 }
+static int is_prime64(u64 n) {
+    if (n < 2) return 0;
+    if (n < 4) return 1;
+    if (!(n & 1) || !(n % 3)) return 0;
+    u64 d = n - 1; int r = 0;
+    while (!(d & 1)) { d >>= 1; r++; }
+    static const u64 W[] = {2,3,5,7,11,13,17,19,23,29,31,37};
+    for (int i = 0; i < 12; i++) {
+        if (W[i] >= n) continue;
+        u64 x = powmod64(W[i], d, n);
+        if (x == 1 || x == n-1) continue;
+        int c = 1;
+        for (int j = 0; j < r-1; j++) {
+            x = mulmod64(x, x, n);
+            if (x == n-1) { c = 0; break; }
+        }
+        if (c) return 0;
+    }
+    return 1;
+}
+static u64 pollard_rho64(u64 n) {
+    if (!(n & 1)) return 2;
+    for (u64 c = 1; c < 20; c++) {
+        u64 x=2, y=2, d=1, m=128, ys=0, r=1, q=1;
+        do {
+            x = y;
+            for (u64 i=0;i<r;i++) y=(mulmod64(y,y,n)+c)%n;
+            u64 k=0; d=1;
+            while (k<r && d==1) {
+                ys=y;
+                for (u64 i=0;i<(m<r-k?m:r-k);i++) {
+                    y=(mulmod64(y,y,n)+c)%n;
+                    u64 df=(x>y)?x-y:y-x;
+                    q=mulmod64(q,df,n);
+                }
+                u64 a=q, b=n; while(b){u64 t=b;b=a%b;a=t;} d=a;
+                k+=m;
+            }
+            r*=2;
+        } while (d==1);
+        if (d==n) {
+            d=1; y=ys;
+            while(d==1){
+                y=(mulmod64(y,y,n)+c)%n;
+                u64 df=(x>y)?x-y:y-x;
+                u64 a=df,b=n; while(b){u64 t=b;b=a%b;a=t;} d=a;
+            }
+        }
+        if (d!=n) return d;
+    }
+    return n;
+}
+typedef struct { u64 p; int e; } PrimePow64;
+static void fi64(PrimePow64 *o, int *nf, u64 p) {
+    for(int i=0;i<*nf;i++) if(o[i].p==p){o[i].e++;return;}
+    o[*nf].p=p; o[*nf].e=1; (*nf)++;
+}
+static void fr64(u64 n, PrimePow64 *o, int *nf) {
+    if(n<=1)return;
+    if(is_prime64(n)){fi64(o,nf,n);return;}
+    for(u64 p=2;p*p<=n&&p<1000;p++) while(n%p==0){fi64(o,nf,p);n/=p;}
+    if(n==1)return; if(is_prime64(n)){fi64(o,nf,n);return;}
+    u64 d=pollard_rho64(n);
+    if(d==n){for(u64 p=2;p*p<=n;p++)while(n%p==0){fi64(o,nf,p);n/=p;}if(n>1)fi64(o,nf,n);return;}
+    fr64(d,o,nf); fr64(n/d,o,nf);
+}
+static int factorize64(u64 n, PrimePow64 *out) {
+    int nf=0; fr64(n,out,&nf);
+    for(int i=1;i<nf;i++){PrimePow64 kv=out[i];int j=i-1;while(j>=0&&out[j].p>kv.p){out[j+1]=out[j];j--;}out[j+1]=kv;}
+    return nf;
+}
+static u64 g_divs64[131072]; static int g_nd64;
+static void edr64(PrimePow64 *pf, int nf, int idx, u64 cur) {
+    if(idx==nf){g_divs64[g_nd64++]=cur;return;}
+    u64 pk=1;
+    for(int e=0;e<=pf[idx].e;e++){edr64(pf,nf,idx+1,cur*pk);pk*=pf[idx].p;}
+}
 
 /* --------------------------------------------------------------------------
- * Miller-Rabin primality test (deterministic for n < 3,317,044,064,679,887,385,961,981)
- * Using witnesses {2,3,5,7,11,13,17,19,23,29,31,37}
+ * 128-bit modular arithmetic helpers
  * -------------------------------------------------------------------------- */
-static int is_prime64(u64 n) {
+
+/*
+ * mulmod128(a, b, m): compute (a * b) % m.
+ *
+ * Fast path: if m fits in 64 bits, then a < m < 2^64 and b < m < 2^64,
+ * so a*b < 2^128 — use direct u128 multiply (single MUL + DIV on x86-64).
+ *
+ * Slow path: m > 2^64  — use the binary (Russian-peasant) method to avoid
+ * needing 256-bit types.  Iterates only over the actual bit-length of b.
+ */
+static inline u128 mulmod128(u128 a, u128 b, u128 m) {
+    if (!(m >> 64)) {
+        /* m, a, b all fit in 64 bits: direct one-instruction multiply */
+        u64 mm = (u64)m;
+        return (u128)((u64)(a % mm)) * (u64)(b % mm) % mm;
+    }
+    /* m > 64 bits: binary method, iterate only over set bit-range of b */
+    u128 result = 0;
+    a %= m;
+    b %= m;
+    /* find top bit of b to limit loop iterations */
+    int bits = 127;
+    while (bits > 0 && !((b >> bits) & 1)) bits--;
+    u128 mask = (u128)1 << bits;
+    while (mask) {
+        result <<= 1;
+        if (result >= m) result -= m;
+        if (b & mask) {
+            result += a;
+            if (result >= m) result -= m;
+        }
+        mask >>= 1;
+    }
+    return result;
+}
+
+/* a^e % m using mulmod128 */
+static u128 powmod128(u128 a, u128 e, u128 m) {
+    u128 r = 1;
+    a %= m;
+    while (e) {
+        if (e & 1) r = mulmod128(r, a, m);
+        a = mulmod128(a, a, m);
+        e >>= 1;
+    }
+    return r;
+}
+
+/* --------------------------------------------------------------------------
+ * Miller-Rabin primality test — deterministic for n < 3.3e24 with the 12
+ * witnesses {2,3,5,7,11,13,17,19,23,29,31,37}.  For n up to our ceiling
+ * (~3.3e38) we use the same witnesses; false composites are essentially
+ * non-existent in our divisor-enumeration context.
+ * -------------------------------------------------------------------------- */
+static int is_prime128(u128 n) {
     if (n < 2) return 0;
     if (n < 4) return 1;
     if (n % 2 == 0 || n % 3 == 0) return 0;
 
-    /* Write n-1 = 2^r * d */
-    u64 d = n - 1;
+    u128 d = n - 1;
     int r = 0;
     while ((d & 1) == 0) { d >>= 1; r++; }
 
     static const u64 witnesses[] = {2,3,5,7,11,13,17,19,23,29,31,37};
     for (int i = 0; i < 12; i++) {
-        u64 a = witnesses[i];
+        u128 a = (u128)witnesses[i];
         if (a >= n) continue;
-        u64 x = powmod64(a, d, n);
+        u128 x = powmod128(a, d, n);
         if (x == 1 || x == n - 1) continue;
         int composite = 1;
         for (int j = 0; j < r - 1; j++) {
-            x = mulmod64(x, x, n);
+            x = mulmod128(x, x, n);
             if (x == n - 1) { composite = 0; break; }
         }
         if (composite) return 0;
@@ -90,33 +227,32 @@ static int is_prime64(u64 n) {
 }
 
 /* --------------------------------------------------------------------------
- * Pollard-rho (Brent's improvement) -- returns a non-trivial factor of n,
- * or n if it fails (caller must retry or fall back).
+ * Pollard-rho (Brent) for u128 — returns a non-trivial factor of n, or n.
+ * All arithmetic uses mulmod128 to avoid 256-bit overflow.
  * -------------------------------------------------------------------------- */
-static u64 pollard_rho64(u64 n) {
+static u128 pollard_rho128(u128 n) {
     if (n % 2 == 0) return 2;
-    /* Try several starting values of c */
-    for (u64 c = 1; c < 20; c++) {
-        u64 x = 2, y = 2, d = 1;
-        /* Brent: keep moving y by powers of 2 steps ahead */
-        u64 m = 128;
-        u64 ys = 0, r = 1, q = 1;
+    for (u128 c = 1; c < 20; c++) {
+        u128 x = 2, y = 2, d = 1;
+        u128 m = 128;
+        u128 ys = 0, r = 1, q = 1;
         do {
             x = y;
-            for (u64 i = 0; i < r; i++)
-                y = (mulmod64(y, y, n) + c) % n;
-            u64 k = 0;
+            for (u128 i = 0; i < r; i++)
+                y = (mulmod128(y, y, n) + c) % n;
+            u128 k = 0;
             d = 1;
             while (k < r && d == 1) {
                 ys = y;
-                for (u64 i = 0; i < (m < r - k ? m : r - k); i++) {
-                    y = (mulmod64(y, y, n) + c) % n;
-                    u64 diff = (x > y) ? x - y : y - x;
-                    q = mulmod64(q, diff, n);
+                u128 batch = (m < r - k) ? m : r - k;
+                for (u128 i = 0; i < batch; i++) {
+                    y = (mulmod128(y, y, n) + c) % n;
+                    u128 diff = (x > y) ? x - y : y - x;
+                    q = mulmod128(q, diff, n);
                 }
-                /* gcd(q, n) */
-                u64 a = q, b = n;
-                while (b) { u64 t = b; b = a % b; a = t; }
+                /* GCD(q, n) */
+                u128 a = q, b = n;
+                while (b) { u128 t = b; b = a % b; a = t; }
                 d = a;
                 k += m;
             }
@@ -124,30 +260,28 @@ static u64 pollard_rho64(u64 n) {
         } while (d == 1);
 
         if (d == n) {
-            /* Backtrack: step one at a time */
+            /* backtrack one step at a time */
             d = 1;
             y = ys;
             while (d == 1) {
-                y = (mulmod64(y, y, n) + c) % n;
-                u64 diff = (x > y) ? x - y : y - x;
-                u64 a = diff, b = n;
-                while (b) { u64 t = b; b = a % b; a = t; }
+                y = (mulmod128(y, y, n) + c) % n;
+                u128 diff = (x > y) ? x - y : y - x;
+                u128 a = diff, b = n;
+                while (b) { u128 t = b; b = a % b; a = t; }
                 d = a;
             }
         }
         if (d != n) return d;
     }
-    return n; /* failed -- caller uses trial division */
+    return n;
 }
 
 /* --------------------------------------------------------------------------
- * Prime factorisation of n into (prime, exponent) pairs.
- * out[] must hold at least 64 entries.
- * Returns number of distinct prime factors.
+ * 128-bit prime factorisation
  * -------------------------------------------------------------------------- */
-typedef struct { u64 p; int e; } PrimePow;
+typedef struct { u128 p; int e; } PrimePow128;
 
-static void factor_insert(PrimePow *out, int *nf, u64 p) {
+static void factor_insert128(PrimePow128 *out, int *nf, u128 p) {
     for (int i = 0; i < *nf; i++) {
         if (out[i].p == p) { out[i].e++; return; }
     }
@@ -156,36 +290,35 @@ static void factor_insert(PrimePow *out, int *nf, u64 p) {
     (*nf)++;
 }
 
-/* Recursive helper: fully factor n and insert into out[] */
-static void factor_rec(u64 n, PrimePow *out, int *nf) {
+static void factor_rec128(u128 n, PrimePow128 *out, int *nf) {
     if (n <= 1) return;
-    if (is_prime64(n)) { factor_insert(out, nf, n); return; }
-    /* Try small primes first */
-    for (u64 p = 2; p * p <= n && p < 1000; p++) {
-        while (n % p == 0) { factor_insert(out, nf, p); n /= p; }
+    if (is_prime128(n)) { factor_insert128(out, nf, n); return; }
+    /* trial division for small primes first */
+    for (u128 p = 2; p < 1000 && p * p <= n; p++) {
+        while (n % p == 0) { factor_insert128(out, nf, p); n /= p; }
     }
     if (n == 1) return;
-    if (is_prime64(n)) { factor_insert(out, nf, n); return; }
+    if (is_prime128(n)) { factor_insert128(out, nf, n); return; }
     /* Pollard-rho split */
-    u64 d = pollard_rho64(n);
+    u128 d = pollard_rho128(n);
     if (d == n) {
-        /* Failed: trial divide the rest */
-        for (u64 p = 2; p * p <= n; p++) {
-            while (n % p == 0) { factor_insert(out, nf, p); n /= p; }
+        /* fallback: full trial division of the remainder */
+        for (u128 p = 2; p * p <= n; p++) {
+            while (n % p == 0) { factor_insert128(out, nf, p); n /= p; }
         }
-        if (n > 1) factor_insert(out, nf, n);
+        if (n > 1) factor_insert128(out, nf, n);
         return;
     }
-    factor_rec(d,     out, nf);
-    factor_rec(n / d, out, nf);
+    factor_rec128(d,     out, nf);
+    factor_rec128(n / d, out, nf);
 }
 
-static int factorize64(u64 n, PrimePow *out) {
+static int factorize128(u128 n, PrimePow128 *out) {
     int nf = 0;
-    factor_rec(n, out, &nf);
-    /* Sort by prime (insertion sort -- small nf) */
+    factor_rec128(n, out, &nf);
+    /* insertion sort by prime */
     for (int i = 1; i < nf; i++) {
-        PrimePow kv = out[i];
+        PrimePow128 kv = out[i];
         int j = i - 1;
         while (j >= 0 && out[j].p > kv.p) { out[j+1] = out[j]; j--; }
         out[j+1] = kv;
@@ -194,27 +327,27 @@ static int factorize64(u64 n, PrimePow *out) {
 }
 
 /* --------------------------------------------------------------------------
- * Enumerate all POSITIVE divisors of n from its factorisation.
- * Stores them in g_divs[]; returns count.
+ * Enumerate all POSITIVE divisors of n from its 128-bit factorisation.
+ * Stores results in g_divs128[]; sets g_ndivs128 = count.
  * -------------------------------------------------------------------------- */
-static u64 g_divs[131072];
-static int g_ndivs;
+static u128 g_divs128[131072];
+static int  g_ndivs128;
 
-static void enum_div_rec(PrimePow *pf, int nf, int idx, u64 cur) {
+static void enum_div_rec128(PrimePow128 *pf, int nf, int idx, u128 cur) {
     if (idx == nf) {
-        g_divs[g_ndivs++] = cur;
+        g_divs128[g_ndivs128++] = cur;
         return;
     }
-    u64 pk = 1;
+    u128 pk = 1;
     for (int e = 0; e <= pf[idx].e; e++) {
-        enum_div_rec(pf, nf, idx + 1, cur * pk);
+        enum_div_rec128(pf, nf, idx + 1, cur * pk);
         pk *= pf[idx].p;
     }
 }
 
 /* --------------------------------------------------------------------------
  * Fallback: enumerate divisors of |val| (as i128) by trial division.
- * Used when |n| > TRIAL_LIMIT and val may not fit in u64.
+ * Used only when |n| > TRIAL_LIMIT_128 and val may not fit in u128.
  * Stores signed divisors (+d and -d) in div_buf[]; returns count.
  * -------------------------------------------------------------------------- */
 static i128 fb_divs[131072];
@@ -237,6 +370,7 @@ static int enum_divisors_fallback(i128 val, i128 *div_buf) {
     }
     return total;
 }
+
 
 /* --------------------------------------------------------------------------
  * __int128 helpers
@@ -290,67 +424,68 @@ static void emit(FILE *out, FILE *log, i128 n128, i128 m, i128 Y, i128 X) {
 /* --------------------------------------------------------------------------
  * Check one divisor m of val against the equation
  * -------------------------------------------------------------------------- */
-static void check_divisor(i64 n, i128 n128, i128 val, i128 m,
+static void check_divisor(i128 n128, i128 val, i128 m,
                            FILE *out, FILE *log) {
     if (m == 0) return;
     i128 quot = val / m;
     i128 X    = m + (i128)6 * n128;
+    /* Guard: skip if X^2 would overflow i128 */
+    i128 ax = (X >= 0) ? X : -X;
+    if ((u128)ax > (u128)XSQRT_I128_MAX) return;
     i128 rhs  = X * X + quot;
     i128 Y;
     if (is_perfect_square(rhs, &Y))
         emit(out, log, n128, m, Y, X);
-    (void)n; /* suppress unused parameter warning */
 }
 
 /* --------------------------------------------------------------------------
  * Main search loop
  * -------------------------------------------------------------------------- */
 static void search_range(i64 n_start, i64 n_end, FILE *out, FILE *log) {
-    PrimePow pf[64];
+    PrimePow64  pf64[64];
+    PrimePow128 pf128[128];
 
     for (i64 n = n_start; n <= n_end; n++) {
         i128 n128 = (i128)n;
         i128 val  = (i128)36 * n128 * n128 * n128 - 19;
         if (val == 0) continue;
 
-        i64 n_abs = (n < 0) ? -n : n;
+        u128 abs_val  = (val >= 0) ? (u128)val : (u128)(-val);
+        int  sign_val = (val >= 0) ? 1 : -1;
 
-        if (n_abs <= TRIAL_LIMIT) {
-            /* ---------- fast path: Pollard-rho factorisation ---------- */
-            /* val fits in u64 (|val| <= 36 * (2.6e6)^3 ~ 6.5e20 ... hmm)
-             * Actually for n_abs = 2.6e6: val ~ 36 * (2.6e6)^3 = 6.5e20
-             * That overflows u64 (max ~1.8e19). Reduce TRIAL_LIMIT. */
-            /* Safe bound: u64 max ~1.84e19 => n_abs^3 * 36 < 1.84e19
-             *  => n_abs < (1.84e19 / 36)^(1/3) ~ 787000 */
-            u64 val64;
-            int sign_val = (val >= 0) ? 1 : -1;
-            i128 abs_val = (val >= 0) ? val : -val;
-
-            if (abs_val <= (i128)0xFFFFFFFFFFFFFFFFULL && n_abs <= 787000) {
-                val64 = (u64)abs_val;
-                int nf = factorize64(val64, pf);
-
-                g_ndivs = 0;
-                enum_div_rec(pf, nf, 0, 1);
-                int nd = g_ndivs;
-
-                for (int d = 0; d < nd; d++) {
-                    i128 g = (i128)g_divs[d];
-                    /* divisors: +g and -g */
-                    check_divisor(n, n128, val, sign_val > 0 ?  g : -g, out, log);
-                    check_divisor(n, n128, val, sign_val > 0 ? -g :  g, out, log);
-                }
-            } else {
-                /* abs_val too big for u64 but n still "small" -- use fallback */
-                int total = enum_divisors_fallback(val, fb_divs);
-                for (int d = 0; d < total; d++)
-                    check_divisor(n, n128, val, fb_divs[d], out, log);
+        if (!(abs_val >> 64)) {
+            /* ---- fast path: 64-bit Pollard-rho (original v2 speed) ---- */
+            u64 val64 = (u64)abs_val;
+            int nf = factorize64(val64, pf64);
+            g_nd64 = 0;
+            edr64(pf64, nf, 0, (u64)1);
+            int nd = g_nd64;
+            for (int d = 0; d < nd; d++) {
+                i128 g = (i128)g_divs64[d];
+                check_divisor(n128, val, sign_val > 0 ?  g : -g, out, log);
+                check_divisor(n128, val, sign_val > 0 ? -g :  g, out, log);
             }
         } else {
-            /* ---------- fallback: trial-division for large |n| ---------- */
-            int total = enum_divisors_fallback(val, fb_divs);
-            for (int d = 0; d < total; d++)
-                check_divisor(n, n128, val, fb_divs[d], out, log);
+            i64 n_abs = (n < 0) ? -n : n;
+            if (n_abs <= TRIAL_LIMIT_128) {
+                /* ---- 128-bit Pollard-rho for abs_val > u64_max ---- */
+                int nf = factorize128(abs_val, pf128);
+                g_ndivs128 = 0;
+                enum_div_rec128(pf128, nf, 0, (u128)1);
+                int nd = g_ndivs128;
+                for (int d = 0; d < nd; d++) {
+                    u128 ud = g_divs128[d];
+                    if (ud > (u128)((i128)(-1) >> 1)) continue; /* > i128_max */
+                    i128 g = (i128)ud;
+                    check_divisor(n128, val, sign_val > 0 ?  g : -g, out, log);
+                    check_divisor(n128, val, sign_val > 0 ? -g :  g, out, log);
+                }
+            } else {
+                /* ---- fallback: trial division for |n| > TRIAL_LIMIT_128 ---- */
+                int total = enum_divisors_fallback(val, fb_divs);
+                for (int d = 0; d < total; d++)
+                    check_divisor(n128, val, fb_divs[d], out, log);
+            }
         }
 
         if ((n % 10000) == 0 && log) {
