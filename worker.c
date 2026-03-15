@@ -50,6 +50,64 @@ typedef unsigned __int128 u128;
 #define XSQRT_I128_MAX  13043817825332782212ULL  /* floor(sqrt(2^127)) */
 
 /* --------------------------------------------------------------------------
+ * Outer n-level sieve
+ *
+ * For small primes p, precompute which residues n mod p can NEVER yield a
+ * solution.  The key test: for a given n mod p set val = 36n³-19 mod p.
+ * If p ∤ val, every real divisor m of val satisfies gcd(m,p)=1, so we
+ * enumerate all m ∈ {1..p-1} and compute rhs = (m+6n)² + val·m⁻¹ (mod p).
+ * If rhs is a quadratic non-residue mod p for ALL such m, no solution can
+ * exist for this n — skip it entirely.
+ * When p | val we conservatively keep the n (allow through).
+ *
+ * Primes 7, 11, 13 collectively eliminate ~20-25% of n values before any
+ * factorisation is attempted (verified: p=7 alone kills n≡0 mod 7 = 14.3%).
+ * -------------------------------------------------------------------------- */
+#define N_SIEVE_PRIMES 3
+static const int SIEVE_PRIMES[N_SIEVE_PRIMES] = {7, 11, 13};
+/* sieve_bad[i][r] = 1 iff n ≡ r (mod SIEVE_PRIMES[i]) can be skipped */
+static int sieve_bad[N_SIEVE_PRIMES][16];
+static int sieve_ready = 0;
+
+static int powmod_sm(int base, int exp, int mod) {
+    int r = 1; base %= mod;
+    while (exp > 0) {
+        if (exp & 1) r = (int)((long long)r * base % mod);
+        base = (int)((long long)base * base % mod);
+        exp >>= 1;
+    }
+    return r;
+}
+
+static void init_outer_sieve(void) {
+    if (sieve_ready) return;
+    sieve_ready = 1;
+    for (int pi = 0; pi < N_SIEVE_PRIMES; pi++) {
+        int p = SIEVE_PRIMES[pi];
+        int qr[16] = {0};
+        for (int i = 0; i < p; i++) qr[(i*i) % p] = 1;
+        for (int nr = 0; nr < p; nr++) {
+            int n2  = (int)((long long)nr * nr % p);
+            int n3  = (int)((long long)n2 * nr % p);
+            /* val = 36n^3 - 19 mod p */
+            int val = (int)(((long long)(36 % p) * n3 % p
+                             - 19 % p + 2*p) % p);
+            if (val == 0) { sieve_bad[pi][nr] = 0; continue; } /* p|val: keep */
+            int sixn = (int)(6LL * nr % p);
+            int can  = 0;
+            for (int m = 1; m < p && !can; m++) {
+                int mi  = powmod_sm(m, p - 2, p);         /* m^{-1} mod p */
+                int d   = (int)((long long)val * mi % p); /* val/m  mod p */
+                int X   = (m + sixn) % p;
+                int rhs = (int)((long long)X * X % p + d) % p;
+                if (qr[rhs]) can = 1;
+            }
+            sieve_bad[pi][nr] = can ? 0 : 1;
+        }
+    }
+}
+
+/* --------------------------------------------------------------------------
  * 64-bit fast path (v2): Pollard-rho for u64 values.
  * Used when abs_val fits in u64 (i.e. |n| <= ~787000).
  * -------------------------------------------------------------------------- */
@@ -424,23 +482,29 @@ static void emit(FILE *out, FILE *log, i128 n128, i128 m, i128 Y, i128 X) {
 /* --------------------------------------------------------------------------
  * Modular QR sieve bitmasks
  *
- * For a perfect square Y² = rhs, rhs must be a quadratic residue modulo
- * every integer.  We test three fast filters before calling the expensive
- * Newton isqrt.  Each filter is a bitmask: bit i is set iff i is a QR.
+ * rhs = (m+6n)² + val/m  must be a perfect square, so it must be a
+ * quadratic residue mod every integer.  Four independent bitmask filters:
  *
- *  mod 64  — QRs {0,1,4,9,16,17,25,33,36,41,49,57}  →  12/64  → ~81% kill
- *  mod 45  — QRs {0,1,4,9,10,16,19,25,31,34,36,40}  →  12/45  → ~73% of rest
- *  mod 9   — QRs {0,1,4,7}                           →   4/9   → ~56% of rest
+ *  mod 64  QRs: 12/64  → ~81% kill  (free: just bottom 6 bits)
+ *  mod 45  QRs: 12/45  → ~73% of remainder  (covers primes 3² and 5)
+ *  mod  7  QRs:  4/ 7  → ~43% of remainder  (independent prime)
+ *  mod 11  QRs:  6/11  → ~45% of remainder  (independent prime)
  *
- * Combined: >98% of non-square rhs values are rejected before any sqrt.
- * mod-64 is free (rhs & 63); mod-45 and mod-9 compile to multiply-by-
- * reciprocal for the constant divisor (GCC -O3).
+ * Note: mod-9 (former 3rd filter) was REDUNDANT — any rhs passing mod-45
+ * already passes mod-9 (since 9|45).  Replaced with mod-7 and mod-11.
+ *
+ * Combined false-positive rate: ≈ (12/64)×(12/45)×(4/7)×(6/11) ≈ 1.6%
+ * vs the old chain's effective rate of (12/64)×(12/45) ≈ 5.0%.
+ * GCC -O3 compiles all constant-divisor % to multiply-by-reciprocal.
  * -------------------------------------------------------------------------- */
 #define QR64_MASK  0x0202021202030213ULL
 #define QR45_MASK  ( (1ULL<< 0)|(1ULL<< 1)|(1ULL<< 4)|(1ULL<< 9)|(1ULL<<10) \
                    | (1ULL<<16)|(1ULL<<19)|(1ULL<<25)|(1ULL<<31)|(1ULL<<34) \
                    | (1ULL<<36)|(1ULL<<40) )
-#define QR9_MASK   ( (1U<<0)|(1U<<1)|(1U<<4)|(1U<<7) )
+/* QRs mod  7: {0,1,2,4}          */ 
+#define QR7_MASK   ( (1U<<0)|(1U<<1)|(1U<<2)|(1U<<4) )
+/* QRs mod 11: {0,1,3,4,5,9}      */
+#define QR11_MASK  ( (1U<<0)|(1U<<1)|(1U<<3)|(1U<<4)|(1U<<5)|(1U<<9) )
 
 /* --------------------------------------------------------------------------
  * Check one divisor m of val against the equation
@@ -460,7 +524,8 @@ static void check_divisor(i128 n128, i128 val, i128 m,
     if (!((QR64_MASK >> (unsigned)(rhs & 63)) & 1)) return;        /* mod 64 */
     u128 urhs = (u128)rhs;
     if (!((QR45_MASK >> (unsigned)(urhs % 45)) & 1)) return;       /* mod 45 */
-    if (!((QR9_MASK  >> (unsigned)(urhs %  9)) & 1)) return;       /* mod  9 */
+    if (!((QR7_MASK  >> (unsigned)(urhs %  7)) & 1)) return;       /* mod  7 */
+    if (!((QR11_MASK >> (unsigned)(urhs % 11)) & 1)) return;       /* mod 11 */
 
     i128 Y;
     if (is_perfect_square(rhs, &Y))
@@ -474,7 +539,20 @@ static void search_range(i64 n_start, i64 n_end, FILE *out, FILE *log) {
     PrimePow64  pf64[64];
     PrimePow128 pf128[128];
 
+    init_outer_sieve();  /* no-op after first call */
+
     for (i64 n = n_start; n <= n_end; n++) {
+        /* ---- outer n-level sieve ---- */
+        {
+            int skip = 0;
+            for (int pi = 0; pi < N_SIEVE_PRIMES && !skip; pi++) {
+                int p  = SIEVE_PRIMES[pi];
+                int nr = (int)(((n % (i64)p) + (i64)p) % (i64)p);
+                if (sieve_bad[pi][nr]) skip = 1;
+            }
+            if (skip) continue;
+        }
+
         i128 n128 = (i128)n;
         i128 val  = (i128)36 * n128 * n128 * n128 - 19;
         if (val == 0) continue;
