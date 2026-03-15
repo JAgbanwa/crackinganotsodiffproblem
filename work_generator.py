@@ -36,7 +36,8 @@ BOINC_PROJECT_DIR = os.environ.get("BOINC_PROJECT_DIR", "/home/boincadm/projects
 DOWNLOAD_DIR      = os.path.join(BOINC_PROJECT_DIR, "download")
 STATE_FILE        = "wg_state.json"
 WU_NAME_PREFIX    = "s3ceq"
-N_PER_WU          = 50_000          # n-values per work unit
+N_PER_WU          = 100_000         # n-values per work unit
+                                    # v3: ~4s at 26k n/s (|n|<787k), ~2min at 830 n/s (large n)
 MAX_QUEUED_WU     = 500             # keep at most this many open WUs
 DEFAULT_APP_NAME  = "s3ceq_worker"
 
