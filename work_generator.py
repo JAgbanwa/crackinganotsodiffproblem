@@ -38,6 +38,7 @@ STATE_FILE        = "wg_state.json"
 WU_NAME_PREFIX    = "s3ceq"
 N_PER_WU          = 100_000         # n-values per work unit
                                     # v3: ~4s at 26k n/s (|n|<787k), ~2min at 830 n/s (large n)
+DEFAULT_DENOM     = 1               # denominator D; >1 for rational n=N/D search
 MAX_QUEUED_WU     = 500             # keep at most this many open WUs
 DEFAULT_APP_NAME  = "s3ceq_worker"
 _TEST_MODE        = False   # set True in main() when --test is given
@@ -62,7 +63,7 @@ def n_range_for_y(y_target: int, headroom: float = 2.0):
 
 # ── State persistence ─────────────────────────────────────────────────────────
 def load_state(start_pos: int = 0, start_neg: int = -1,
-               bands: list | None = None) -> dict:
+               bands: list | None = None, D: int = 1) -> dict:
     """
     Load or initialise state.  bands is a list of (lo, hi) integer pairs;
     when supplied the state tracks each band independently and interleaves WUs.
@@ -76,15 +77,16 @@ def load_state(start_pos: int = 0, start_neg: int = -1,
         state = {"wu_count": 0}
 
     if bands:
-        # Multi-band mode — each band has its own cursor
+        # Multi-band mode — each band has its own cursor and optional D
         existing = {b["key"]: b for b in state.get("bands", [])}
         new_bands = []
-        for lo, hi in bands:
-            key = f"{lo}:{hi}"
+        for entry in bands:
+            lo, hi, band_D = entry  # (lo, hi, D)
+            key = f"{lo}:{hi}:{band_D}"
             if key in existing:
                 new_bands.append(existing[key])
             else:
-                new_bands.append({"key": key, "lo": lo, "hi": hi,
+                new_bands.append({"key": key, "lo": lo, "hi": hi, "D": band_D,
                                    "next_pos": lo, "next_neg": -lo - 1})
         state["bands"] = new_bands
         state.setdefault("band_idx", 0)
@@ -98,6 +100,7 @@ def load_state(start_pos: int = 0, start_neg: int = -1,
             state["next_neg_n"] = start_neg
         elif start_neg != -1:
             state["next_neg_n"] = start_neg
+        state.setdefault("D", D)
     return state
 
 def save_state(state: dict):
@@ -106,13 +109,16 @@ def save_state(state: dict):
 
 # ── Work unit creation ────────────────────────────────────────────────────────
 def write_wu_input(wu_name: str, n_start: int, n_end: int,
-                   test_mode: bool = False) -> str:
+                   test_mode: bool = False, D: int = 1) -> str:
     """Write work-unit input file; return local filename."""
     fname = f"{wu_name}.txt"
     outdir = "/tmp/s3ceq_test_wu" if test_mode else DOWNLOAD_DIR
     os.makedirs(outdir, exist_ok=True)
     with open(os.path.join(outdir, fname), "w") as f:
-        f.write(f"{n_start} {n_end}\n")
+        if D == 1:
+            f.write(f"{n_start} {n_end}\n")       # backward-compatible
+        else:
+            f.write(f"{n_start} {n_end} {D}\n")   # rational mode
     return fname
 
 def submit_wu_boinc(wu_name: str, input_fname: str,
@@ -140,11 +146,11 @@ def submit_wu_boinc(wu_name: str, input_fname: str,
         return True  # stub success in test mode
 
 def create_work_unit(state: dict, n_start: int, n_end: int,
-                     direction: str = "pos") -> bool:
-    """Create one work unit for n in [n_start, n_end]."""
+                     direction: str = "pos", D: int = 1) -> bool:
+    """Create one work unit for N in [n_start, n_end] with denominator D."""
     wuid      = state["wu_count"] + 1
     wu_name   = f"{WU_NAME_PREFIX}_{direction}_{wuid:010d}"
-    input_f   = write_wu_input(wu_name, n_start, n_end, test_mode=_TEST_MODE)
+    input_f   = write_wu_input(wu_name, n_start, n_end, test_mode=_TEST_MODE, D=D)
     ok        = submit_wu_boinc(wu_name, input_f)
     if ok:
         state["wu_count"] = wuid
@@ -153,12 +159,12 @@ def create_work_unit(state: dict, n_start: int, n_end: int,
 # ── Main generation loop ──────────────────────────────────────────────────────
 def run_generator(n_per_wu: int, max_queued: int, test_mode: bool,
                   num_wu_test: int, start_pos: int = 0, start_neg: int = -1,
-                  bands: list | None = None):
+                  bands: list | None = None, D: int = 1):
     """
     bands: list of (lo, hi) n-ranges to interleave.  When None, use single
     range starting at start_pos / start_neg (legacy mode).
     """
-    state = load_state(start_pos, start_neg, bands)
+    state = load_state(start_pos, start_neg, bands, D)
 
     if bands:
         log.info(f"Multi-band mode: {len(state['bands'])} bands, "
@@ -177,6 +183,7 @@ def run_generator(n_per_wu: int, max_queued: int, test_mode: bool,
             band_list = state["bands"]
             bi = state["band_idx"] % len(band_list)
             b  = band_list[bi]
+            band_D = b.get("D", 1)
 
             # Positive slice of this band
             ps = b["next_pos"]
@@ -185,7 +192,7 @@ def run_generator(n_per_wu: int, max_queued: int, test_mode: bool,
                 pe = b["hi"]
             if ps <= b["hi"]:
                 create_work_unit(state, ps, pe,
-                                 direction=f"pos_b{bi}")
+                                 direction=f"pos_b{bi}", D=band_D)
                 b["next_pos"] = pe + 1
                 save_state(state)
 
@@ -195,28 +202,29 @@ def run_generator(n_per_wu: int, max_queued: int, test_mode: bool,
             lo_neg = -(b["hi"] + 1)
             if ne >= lo_neg:
                 create_work_unit(state, ns, ne,
-                                 direction=f"neg_b{bi}")
+                                 direction=f"neg_b{bi}", D=band_D)
                 b["next_neg"] = ns - 1
                 save_state(state)
 
             state["band_idx"] = (bi + 1) % len(band_list)
-            log.info(f"WUs: {state['wu_count']} | band[{bi}] "
+            log.info(f"WUs: {state['wu_count']} | band[{bi}](D={band_D}) "
                      f"pos={b['next_pos']} neg={b['next_neg']}")
         else:
             # ── Legacy single-range mode ──────────────────────────────────
             ps = state["next_pos_n"]
             pe = ps + n_per_wu - 1
-            create_work_unit(state, ps, pe, direction="pos")
+            legacy_D = state.get("D", D)
+            create_work_unit(state, ps, pe, direction="pos", D=legacy_D)
             state["next_pos_n"] = pe + 1
             save_state(state)
 
             ns = state["next_neg_n"] - n_per_wu + 1
             ne = state["next_neg_n"]
-            create_work_unit(state, ns, ne, direction="neg")
+            create_work_unit(state, ns, ne, direction="neg", D=legacy_D)
             state["next_neg_n"] = ns - 1
             save_state(state)
 
-            log.info(f"WUs created: {state['wu_count']} | "
+            log.info(f"WUs: {state['wu_count']} | D={legacy_D} "
                      f"pos up to {pe} | neg down to {ns}")
 
         iterations += 1
@@ -259,8 +267,11 @@ Examples:
     parser.add_argument("--neg_start_n", type=int, default=-1,
                         help="Bootstrap negative-n cursor (default: -1)")
     parser.add_argument("--bands", type=str, default=None,
-                        help="Comma-separated list of lo:hi n-ranges to search in parallel, "
-                             "e.g. 0:1000000,100000000000:1000000000000")
+                        help="Comma-separated list of lo:hi[:D] n-ranges to search. "
+                             "D defaults to --denom. "
+                             "e.g. 0:1000000,0:3000000:2,0:6000000:3")
+    parser.add_argument("--denom", type=int, default=DEFAULT_DENOM,
+                        help="Global denominator D for rational n=N/D search (default: 1)")
     parser.add_argument("--target_y", type=int, default=None,
                         help="Auto-set --bands for the n range covering divisors |y| ~ target_y")
     args = parser.parse_args()
@@ -274,21 +285,26 @@ Examples:
         log.info(f"--target_y {args.target_y:.3e}: mapped to n range [{lo:,}, {hi:,}]")
         args.bands = f"{lo}:{hi}"
 
-    # Parse --bands string → list of (lo, hi)
+    # Parse --bands string → list of (lo, hi, D)
     parsed_bands = None
     if args.bands:
         try:
-            parsed_bands = [
-                tuple(int(x) for x in seg.split(":"))
-                for seg in args.bands.split(",")
-            ]
+            parsed_bands = []
+            for seg in args.bands.split(","):
+                parts = seg.split(":")
+                if len(parts) == 2:
+                    parsed_bands.append((int(parts[0]), int(parts[1]), args.denom))
+                elif len(parts) == 3:
+                    parsed_bands.append((int(parts[0]), int(parts[1]), int(parts[2])))
+                else:
+                    raise ValueError(seg)
         except ValueError:
-            parser.error("--bands must be comma-separated lo:hi integer pairs")
+            parser.error("--bands must be comma-separated lo:hi[:D] integer tuples")
         log.info(f"Bands: {parsed_bands}")
 
     run_generator(args.n_per_wu, args.max_queued, args.test, args.num_wu,
                   start_pos=args.start_n, start_neg=args.neg_start_n,
-                  bands=parsed_bands)
+                  bands=parsed_bands, D=args.denom)
 
 
 if __name__ == "__main__":

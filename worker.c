@@ -1,27 +1,21 @@
 /*
- * worker.c  --  Charity Engine / BOINC worker  (v3: 128-bit Pollard-rho)
+ * worker.c  --  Charity Engine / BOINC worker  (v4: rational D-denominator)
  *
- * Searches for ALL integer solutions (n, m, Y) satisfying:
+ * Searches for integer Y satisfying:
  *
- *     Y^2 = (m + 6n)^2 + (36n^3 - 19) / m     (m != 0, m | 36n^3-19)
+ *   D = 1 (integer mode, default):
+ *     Y^2 = (m + 6n)^2 + (36n^3 - 19) / m       m != 0, m | 36n^3-19
  *
- * Strategy per n:
- *   1. val = 36*n^3 - 19
- *   2. Factorise |val| via 128-bit Pollard-rho (Miller-Rabin primality test)
- *   3. Enumerate all 2*d(val) divisors (pos & neg) from the factorisation
- *   4. For each divisor m: rhs = (m+6n)^2 + val/m; check perfect square
+ *   D > 1 (rational mode — new):
+ *     n = N/D,  m = M/D^3     (N,M integers, M | 36N^3-19D^3)
+ *     Y^2 = Xd^2 + (36N^3-19D^3)/M   where Xd = (M + 6*N*D^2)/D^3
+ *     (Xd must be integer, i.e. D^3 | M + 6*N*D^2)
+ *     Solutions give x^3 + y^3 + z^3 = 114 via rational triples.
  *
- * v3 changes vs v2:
- *   - Full 128-bit Pollard-rho (mulmod128 via binary method).
- *   - No 64-bit ceiling: fast path covers all |n| <= TRIAL_LIMIT_128 = 2.1e12.
- *   - For |n| > 2.1e12 fall back to trial division (very rarely needed with CE).
- *   - Overflow guard: skip divisors where (m+6n)^2 would exceed i128.
+ * wu_file format:  "N_start N_end"        (D=1 default, backward compat)
+ *                  "N_start N_end D"       (D > 1 for rational search)
  *
- * Uses __int128 / unsigned __int128 throughout (GCC/Clang extension).
- *
- * Usage:  ./worker <wu_file> <output_file>
- * wu_file: single line "n_start n_end"
- * output:  one solution per line: n=... m=... Y=... X=...
+ * Output:  n=N/D m=M/D^3 Y=Y X=Xd  (D=1 omits denominators for clarity)
  */
 
 #include <stdio.h>
@@ -67,7 +61,6 @@ typedef unsigned __int128 u128;
 static const int SIEVE_PRIMES[N_SIEVE_PRIMES] = {7, 11, 13};
 /* sieve_bad[i][r] = 1 iff n ≡ r (mod SIEVE_PRIMES[i]) can be skipped */
 static int sieve_bad[N_SIEVE_PRIMES][16];
-static int sieve_ready = 0;
 
 static int powmod_sm(int base, int exp, int mod) {
     int r = 1; base %= mod;
@@ -79,27 +72,40 @@ static int powmod_sm(int base, int exp, int mod) {
     return r;
 }
 
-static void init_outer_sieve(void) {
-    if (sieve_ready) return;
-    sieve_ready = 1;
+/*
+ * init_outer_sieve_D: for a given denominator D, precompute which residues
+ * N mod p (for p in SIEVE_PRIMES) can never yield an integer Y solution.
+ * Formula: val_D = 36*N^3 - 19*D^3 mod p.
+ * When p | val_D (val=0): conservatively allow N through.
+ * Otherwise: for every unit m mod p, compute Xd = (m+6*N*D^2)*inv(D^3) mod p,
+ * rhs = Xd^2 + val_D*inv(m) mod p; if rhs is never a QR mod p for any m,
+ * mark this N residue as bad (skip).
+ * For D=1 this reduces to the old formula identically.
+ */
+static void init_outer_sieve_D(int D) {
     for (int pi = 0; pi < N_SIEVE_PRIMES; pi++) {
-        int p = SIEVE_PRIMES[pi];
+        int p    = SIEVE_PRIMES[pi];
         int qr[16] = {0};
         for (int i = 0; i < p; i++) qr[(i*i) % p] = 1;
+        int D2p   = powmod_sm(D % p, 2, p);          /* D^2 mod p */
+        int D3p   = powmod_sm(D % p, 3, p);          /* D^3 mod p */
+        int invD3 = (D3p == 0) ? 1 : powmod_sm(D3p, p - 2, p); /* D^-3 mod p */
+        /* Note: for p in {7,11,13} and D in {1..6}, D3p != 0 always. */
         for (int nr = 0; nr < p; nr++) {
             int n2  = (int)((long long)nr * nr % p);
             int n3  = (int)((long long)n2 * nr % p);
-            /* val = 36n^3 - 19 mod p */
-            int val = (int)(((long long)(36 % p) * n3 % p
-                             - 19 % p + 2*p) % p);
-            if (val == 0) { sieve_bad[pi][nr] = 0; continue; } /* p|val: keep */
-            int sixn = (int)(6LL * nr % p);
-            int can  = 0;
+            /* val_D = 36*N^3 - 19*D^3  mod p */
+            int val = (int)(((long long)(36 % p) * n3
+                             - (long long)(19 % p) * D3p % p + 3LL*p) % p);
+            if (val == 0) { sieve_bad[pi][nr] = 0; continue; }
+            int can = 0;
             for (int m = 1; m < p && !can; m++) {
-                int mi  = powmod_sm(m, p - 2, p);         /* m^{-1} mod p */
-                int d   = (int)((long long)val * mi % p); /* val/m  mod p */
-                int X   = (m + sixn) % p;
-                int rhs = (int)((long long)X * X % p + d) % p;
+                int mi     = powmod_sm(m, p - 2, p);
+                int d      = (int)((long long)val * mi % p);    /* val_D/M mod p */
+                int X_int  = (int)(((long long)m
+                              + 6LL * nr % p * D2p) % p);       /* M+6*N*D^2 mod p */
+                int Xd     = (int)((long long)X_int * invD3 % p); /* /D^3 mod p */
+                int rhs    = (int)((long long)Xd * Xd % p + d) % p;
                 if (qr[rhs]) can = 1;
             }
             sieve_bad[pi][nr] = can ? 0 : 1;
@@ -456,24 +462,31 @@ static void print128(FILE *fp, i128 v) {
 }
 
 /* --------------------------------------------------------------------------
- * Emit a solution (and its Y/-Y pair) to the output file
+ * emit_D: print one solution.  D=1 → integer n,m (same format as before).
+ * D>1 → rational n=N/D, m=M/D^3.
  * -------------------------------------------------------------------------- */
-static void emit(FILE *out, FILE *log, i128 n128, i128 m, i128 Y, i128 X) {
-    fprintf(out, "n="); print128(out, n128);
-    fprintf(out, " m="); print128(out, m);
+static void print_nm(FILE *f, i128 N, i128 M, i128 D3, int D_val) {
+    fprintf(f, "n="); print128(f, N);
+    if (D_val != 1) fprintf(f, "/%d", D_val);
+    fprintf(f, " m="); print128(f, M);
+    if (D_val != 1) { fprintf(f, "/"); print128(f, D3); }
+}
+static void emit_D(FILE *out, FILE *log,
+                   i128 N128, i128 M, i128 Y, i128 Xd,
+                   i128 D3, int D_val) {
+    print_nm(out, N128, M, D3, D_val);
     fprintf(out, " Y="); print128(out, Y);
-    fprintf(out, " X="); print128(out, X);
+    fprintf(out, " X="); print128(out, Xd);
     fprintf(out, "\n"); fflush(out);
     if (Y != 0) {
-        fprintf(out, "n="); print128(out, n128);
-        fprintf(out, " m="); print128(out, m);
+        print_nm(out, N128, M, D3, D_val);
         fprintf(out, " Y="); print128(out, -Y);
-        fprintf(out, " X="); print128(out, X);
+        fprintf(out, " X="); print128(out, Xd);
         fprintf(out, "\n"); fflush(out);
     }
     if (log) {
-        fprintf(log, "[SOLUTION] n="); print128(log, n128);
-        fprintf(log, " m="); print128(log, m);
+        fprintf(log, "[SOLUTION] ");
+        print_nm(log, N128, M, D3, D_val);
         fprintf(log, " Y="); print128(log, Y);
         fprintf(log, "\n"); fflush(log);
     }
@@ -507,20 +520,29 @@ static void emit(FILE *out, FILE *log, i128 n128, i128 m, i128 Y, i128 X) {
 #define QR11_MASK  ( (1U<<0)|(1U<<1)|(1U<<3)|(1U<<4)|(1U<<5)|(1U<<9) )
 
 /* --------------------------------------------------------------------------
- * Check one divisor m of val against the equation
+ * check_divisor_D: unified integer+rational divisor check.
+ *
+ * For D=1: identical to the old check_divisor (N128=n, val_D=val, M=m,
+ *           D2=1, D3=1 — so X_int = M+6*N, divisibility trivially holds,
+ *           Xd = X_int, rhs = Xd^2 + val/M).
+ * For D>1: n=N/D, m=M/D^3; Xd=(M+6*N*D^2)/D^3 must be integer.
  * -------------------------------------------------------------------------- */
-static void check_divisor(i128 n128, i128 val, i128 m,
-                           FILE *out, FILE *log) {
-    if (m == 0) return;
-    i128 quot = val / m;
-    i128 X    = m + (i128)6 * n128;
-    /* Guard: skip if X^2 would overflow i128 */
-    i128 ax = (X >= 0) ? X : -X;
-    if ((u128)ax > (u128)XSQRT_I128_MAX) return;
-    i128 rhs  = X * X + quot;
+static void check_divisor_D(i128 N128, i128 valD, i128 M,
+                              i128 D2,   i128 D3,  int D_val,
+                              FILE *out, FILE *log) {
+    if (M == 0) return;
+    i128 quot  = valD / M;                    /* integer since M | valD */
+    i128 X_int = M + (i128)6 * N128 * D2;    /* = D^3 * (m + 6n) */
+    /* For D>1: must have D^3 | X_int for rhs to be integer */
+    if (D3 != 1 && X_int % D3 != 0) return;
+    i128 Xd = (D3 == 1) ? X_int : X_int / D3;
+    /* overflow guard: skip if Xd^2 would exceed i128 */
+    i128 axd = (Xd >= 0) ? Xd : -Xd;
+    if ((u128)axd > (u128)XSQRT_I128_MAX) return;
+    i128 rhs = Xd * Xd + quot;
     if (rhs < 0) return;
 
-    /* ---- QR modular sieve (reject non-squares before the costly isqrt) ---- */
+    /* ---- QR modular sieve ---- */
     if (!((QR64_MASK >> (unsigned)(rhs & 63)) & 1)) return;        /* mod 64 */
     u128 urhs = (u128)rhs;
     if (!((QR45_MASK >> (unsigned)(urhs % 45)) & 1)) return;       /* mod 45 */
@@ -529,39 +551,44 @@ static void check_divisor(i128 n128, i128 val, i128 m,
 
     i128 Y;
     if (is_perfect_square(rhs, &Y))
-        emit(out, log, n128, m, Y, X);
+        emit_D(out, log, N128, M, Y, Xd, D3, D_val);
 }
 
 /* --------------------------------------------------------------------------
  * Main search loop
  * -------------------------------------------------------------------------- */
-static void search_range(i64 n_start, i64 n_end, FILE *out, FILE *log) {
+static void search_range_D(i64 n_start, i64 n_end, int D, FILE *out, FILE *log) {
     PrimePow64  pf64[64];
     PrimePow128 pf128[128];
 
-    init_outer_sieve();  /* no-op after first call */
+    init_outer_sieve_D(D);   /* (re)build sieve for this D */
 
-    for (i64 n = n_start; n <= n_end; n++) {
-        /* ---- outer n-level sieve ---- */
+    /* Precompute D powers as i128 so arithmetic is uniform */
+    i128 D_128 = (i128)D;
+    i128 D2    = D_128 * D_128;          /* D^2 */
+    i128 D3    = D2    * D_128;          /* D^3 */
+    i128 D3_19 = D3    * (i128)19;       /* 19 * D^3  (constant term in valD) */
+
+    for (i64 N = n_start; N <= n_end; N++) {
+        /* ---- outer N-level sieve ---- */
         {
             int skip = 0;
             for (int pi = 0; pi < N_SIEVE_PRIMES && !skip; pi++) {
                 int p  = SIEVE_PRIMES[pi];
-                int nr = (int)(((n % (i64)p) + (i64)p) % (i64)p);
+                int nr = (int)(((N % (i64)p) + (i64)p) % (i64)p);
                 if (sieve_bad[pi][nr]) skip = 1;
             }
             if (skip) continue;
         }
 
-        i128 n128 = (i128)n;
-        i128 val  = (i128)36 * n128 * n128 * n128 - 19;
-        if (val == 0) continue;
+        i128 N128  = (i128)N;
+        i128 valD  = (i128)36 * N128 * N128 * N128 - D3_19;  /* 36N^3 - 19D^3 */
+        if (valD == 0) continue;
 
-        u128 abs_val  = (val >= 0) ? (u128)val : (u128)(-val);
-        int  sign_val = (val >= 0) ? 1 : -1;
+        u128 abs_val  = (valD >= 0) ? (u128)valD : (u128)(-valD);
+        int  sign_val = (valD >= 0) ? 1 : -1;
 
         if (!(abs_val >> 64)) {
-            /* ---- fast path: 64-bit Pollard-rho (original v2 speed) ---- */
             u64 val64 = (u64)abs_val;
             int nf = factorize64(val64, pf64);
             g_nd64 = 0;
@@ -569,34 +596,36 @@ static void search_range(i64 n_start, i64 n_end, FILE *out, FILE *log) {
             int nd = g_nd64;
             for (int d = 0; d < nd; d++) {
                 i128 g = (i128)g_divs64[d];
-                check_divisor(n128, val, sign_val > 0 ?  g : -g, out, log);
-                check_divisor(n128, val, sign_val > 0 ? -g :  g, out, log);
+                check_divisor_D(N128, valD, sign_val > 0 ?  g : -g,
+                                D2, D3, D, out, log);
+                check_divisor_D(N128, valD, sign_val > 0 ? -g :  g,
+                                D2, D3, D, out, log);
             }
         } else {
-            i64 n_abs = (n < 0) ? -n : n;
+            i64 n_abs = (N < 0) ? -N : N;
             if (n_abs <= TRIAL_LIMIT_128) {
-                /* ---- 128-bit Pollard-rho for abs_val > u64_max ---- */
                 int nf = factorize128(abs_val, pf128);
                 g_ndivs128 = 0;
                 enum_div_rec128(pf128, nf, 0, (u128)1);
                 int nd = g_ndivs128;
                 for (int d = 0; d < nd; d++) {
                     u128 ud = g_divs128[d];
-                    if (ud > (u128)((i128)(-1) >> 1)) continue; /* > i128_max */
+                    if (ud > (u128)((i128)(-1) >> 1)) continue;
                     i128 g = (i128)ud;
-                    check_divisor(n128, val, sign_val > 0 ?  g : -g, out, log);
-                    check_divisor(n128, val, sign_val > 0 ? -g :  g, out, log);
+                    check_divisor_D(N128, valD, sign_val > 0 ?  g : -g,
+                                    D2, D3, D, out, log);
+                    check_divisor_D(N128, valD, sign_val > 0 ? -g :  g,
+                                    D2, D3, D, out, log);
                 }
             } else {
-                /* ---- fallback: trial division for |n| > TRIAL_LIMIT_128 ---- */
-                int total = enum_divisors_fallback(val, fb_divs);
+                int total = enum_divisors_fallback(valD, fb_divs);
                 for (int d = 0; d < total; d++)
-                    check_divisor(n128, val, fb_divs[d], out, log);
+                    check_divisor_D(N128, valD, fb_divs[d], D2, D3, D, out, log);
             }
         }
 
-        if ((n % 10000) == 0 && log) {
-            fprintf(log, "[progress] n=%lld\n", (long long)n);
+        if ((N % 10000) == 0 && log) {
+            fprintf(log, "[progress] N=%lld D=%d\n", (long long)N, D);
             fflush(log);
         }
     }
@@ -613,27 +642,34 @@ int main(int argc, char **argv) {
     FILE *wu = fopen(argv[1], "r");
     if (!wu) { perror("open wu_file"); return 1; }
     i64 n_start, n_end;
-    if (fscanf(wu, "%" SCNd64 " %" SCNd64, &n_start, &n_end) != 2) {
-        fprintf(stderr, "Bad wu_file format (expect: n_start n_end)\n");
+    int D = 1;   /* default: integer search */
+    int nread = fscanf(wu, "%" SCNd64 " %" SCNd64 " %d",
+                       &n_start, &n_end, &D);
+    if (nread < 2) {
+        fprintf(stderr, "Bad wu_file format (expect: N_start N_end [D])\n");
         fclose(wu); return 1;
     }
     fclose(wu);
+    if (D < 1 || D > 1000) {
+        fprintf(stderr, "D=%d out of range [1,1000]\n", D);
+        return 1;
+    }
 
     FILE *out = fopen(argv[2], "w");
     if (!out) { perror("open output_file"); return 1; }
     FILE *log = fopen("worker_progress.log", "a");
 
     if (log) {
-        fprintf(log, "[start] searching n=[%lld, %lld]\n",
-                (long long)n_start, (long long)n_end);
+        fprintf(log, "[start] N=[%lld, %lld] D=%d\n",
+                (long long)n_start, (long long)n_end, D);
         fflush(log);
     }
 
-    search_range(n_start, n_end, out, log);
+    search_range_D(n_start, n_end, D, out, log);
 
     if (log) {
-        fprintf(log, "[done] n=[%lld, %lld]\n",
-                (long long)n_start, (long long)n_end);
+        fprintf(log, "[done] N=[%lld, %lld] D=%d\n",
+                (long long)n_start, (long long)n_end, D);
         fclose(log);
     }
     fclose(out);
