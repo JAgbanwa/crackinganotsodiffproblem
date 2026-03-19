@@ -188,12 +188,16 @@ bash setup_boinc_project.sh
 
 ## Search Progress
 
-| Date | Range searched | Solutions | Worker version |
-|------|---------------|-----------|----------------|
-| 2026-03-14 | $n \in [-100{,}000,\, 100{,}000]$ | 0 | v2 (Pollard-rho, 64-bit) |
-| 2026-03-14 | v3 deployed — ceiling extended to $\|n\| \leq 2.1 \times 10^{12}$ | — | v3 (128-bit Pollard-rho) |
+> Full progress log: **[PROGRESS.md](PROGRESS.md)**
 
-The search is **ongoing** and expands continuously outward from $n = 0$.
+| Date | Range verified negative | Solutions | Worker version |
+|------|------------------------|-----------|----------------|
+| 2026-03-14 | $\|n\| \leq 100{,}000$ | 0 | v2 (64-bit Pollard-rho) |
+| 2026-03-14 | v3 deployed — 128-bit ceiling to $\|n\| \leq 2.1 \times 10^{12}$ | — | v3 |
+| 2026-03-19 | $\|n\| \leq 800{,}000$ (confirmed, all-core sweep) | **0** | v4 (128-bit + D-denominator) |
+
+**Total $n$ values checked: 1,600,000.** No solutions found.  
+The search is **ongoing** — running locally and ready to deploy on Charity Engine.
 
 ### Version History
 
